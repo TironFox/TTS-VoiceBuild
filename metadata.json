@@ -1,0 +1,6 @@
+{
+  "name": "阿里百炼音色设计与分段可控合成控制台",
+  "description": "提供基于自然语言提示词的专属音色拟重构、高级阻尼共鸣特征微调、智能句段划分以及分句情感/语速/声调极控配音合成。",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_API"]
+}
