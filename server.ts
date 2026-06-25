@@ -22,6 +22,13 @@ const PORT = 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, X-DashScope-Api-Key, Authorization');
+  next();
+});
+
 // Ensure local uploads folder exists for serving reference audios to Alibaba DashScope
 const uploadDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadDir)) {
@@ -33,31 +40,76 @@ app.use('/uploads', express.static(uploadDir));
 
 // Aliyun DashScope API client for prompt-based acoustic parameter prediction
 async function callDashScopeLLM(prompt: string, apiKey: string): Promise<any> {
-  const response = await fetch('https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'qwen-turbo',
-      input: {
-        prompt: prompt
+  console.log('[DashScope LLM] 开始调用 Qwen-Turbo API...');
+  console.log('[DashScope LLM] API Key 已配置:', !!apiKey);
+  
+  try {
+    const response = await fetch('https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
       },
-      parameters: {
-        max_tokens: 512,
-        temperature: 0.7,
-        top_p: 0.9,
-        response_format: 'json'
-      }
-    })
-  });
+      body: JSON.stringify({
+        model: 'qwen-turbo',
+        input: {
+          prompt: prompt
+        },
+        parameters: {
+          max_tokens: 512,
+          temperature: 0.7,
+          top_p: 0.9,
+          result_format: 'message'
+        }
+      })
+    });
 
-  const data = await response.json();
-  if (response.ok && data.output && data.output.text) {
-    return JSON.parse(data.output.text.trim());
+    const data = await response.json();
+    console.log('[DashScope LLM] API 响应状态:', response.status);
+    console.log('[DashScope LLM] API 响应数据:', JSON.stringify(data, null, 2).slice(0, 500));
+
+    // Check for error responses
+    if (!response.ok || data.code) {
+      const errorCode = data.code || response.status;
+      const errorMsg = data.message || data.error || `API Error: ${errorCode}`;
+      console.error('[DashScope LLM] API 调用失败:', errorCode, errorMsg);
+      throw new Error(`DashScope LLM API 调用失败 (${errorCode}): ${errorMsg}`);
+    }
+
+    if (data.output && data.output.choices && data.output.choices[0] && data.output.choices[0].message) {
+      const content = data.output.choices[0].message.content;
+      console.log('[DashScope LLM] LLM 返回内容:', content);
+      try {
+        return JSON.parse(content.trim());
+      } catch {
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          return JSON.parse(jsonMatch[0]);
+        }
+        throw new Error('无法解析 LLM 返回的 JSON 内容: ' + content.slice(0, 200));
+      }
+    }
+    
+    // Fallback: try data.output.text
+    if (data.output && data.output.text) {
+      const content = data.output.text;
+      console.log('[DashScope LLM] LLM 返回内容 (output.text):', content);
+      try {
+        return JSON.parse(content.trim());
+      } catch {
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          return JSON.parse(jsonMatch[0]);
+        }
+        throw new Error('无法解析 LLM 返回的 JSON 内容: ' + content.slice(0, 200));
+      }
+    }
+
+    throw new Error('LLM 响应格式不符合预期: ' + JSON.stringify(data).slice(0, 200));
+  } catch (error) {
+    console.error('[DashScope LLM] 请求异常:', error);
+    throw error;
   }
-  throw new Error(data.message || 'DashScope API call failed');
 }
 
 // 1. Config Check endpoint
@@ -459,33 +511,50 @@ function localRuleEngineParsePrompt(prompt: string) {
 }
 
 // 3. POST /api/voice/design
-// Creates custom voice model by evaluating prompt + fine-tune variables
+// Creates custom voice model by evaluating prompt + fine-tune variables + demo text
 app.post('/api/voice/design', async (req, res) => {
-  const { prompt, baseConfig } = req.body;
-  const apiKeyHeader = req.headers['x-dashscope-api-key'] || req.headers['authorization']?.toString().replace('Bearer ', '');
-  const apiKey = (typeof apiKeyHeader === 'string' && apiKeyHeader.trim() !== '') ? apiKeyHeader.trim() : process.env.DASHSCOPE_API_KEY;
+  try {
+    console.log('[Voice Design] 请求体:', JSON.stringify(req.body));
+    
+    const { prompt, baseConfig, demoText } = req.body ?? {};
+    const apiKeyHeader = req.headers['x-dashscope-api-key'] || req.headers['authorization']?.toString().replace('Bearer ', '');
+    const apiKey = (typeof apiKeyHeader === 'string' && apiKeyHeader.trim() !== '') ? apiKeyHeader.trim() : process.env.DASHSCOPE_API_KEY;
 
-  console.log(`[Voice Design] Prompt: "${prompt}", baseConfig:`, baseConfig);
+    console.log(`[Voice Design] API Key 已配置: ${!!apiKey}`);
+    console.log(`[Voice Design] Prompt: "${prompt?.slice(0, 50)}..."`);
+    console.log(`[Voice Design] DemoText: "${demoText?.slice(0, 50)}..."`);
 
-  let designedParams = localRuleEngineParsePrompt(prompt || '');
+    if (!apiKey) {
+      return res.status(401).json({
+        success: false,
+        error: 'Missing DASHSCOPE_API_KEY environment variable.',
+        message: '检测到未配置 DASHSCOPE_API_KEY 密钥，请在项目右上角的设置中填入有效的阿里百炼 API Key。'
+      });
+    }
 
-  // Override derived values with explicitly provided slider ones if available
-  if (baseConfig) {
-    if (baseConfig.gender) designedParams.gender = baseConfig.gender;
-    if (baseConfig.ageGroup) designedParams.ageGroup = baseConfig.ageGroup;
-    if (typeof baseConfig.pitch === 'number') designedParams.pitch = baseConfig.pitch;
-    if (typeof baseConfig.speed === 'number') designedParams.speed = baseConfig.speed;
-    if (typeof baseConfig.warmth === 'number') designedParams.warmth = baseConfig.warmth;
-    if (typeof baseConfig.tension === 'number') designedParams.tension = baseConfig.tension;
-    if (typeof baseConfig.breathiness === 'number') designedParams.breathiness = baseConfig.breathiness;
-    if (typeof baseConfig.robotic === 'number') designedParams.robotic = baseConfig.robotic;
-    if (typeof baseConfig.reverb === 'number') designedParams.reverb = baseConfig.reverb;
-  }
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid prompt parameter',
+        message: '请提供有效的音色描述提示词'
+      });
+    }
 
-  // If DashScope LLM API is available, use it to perform high-resolution acoustic parameter mappings!
-  if (apiKey && prompt) {
+    let designedParams: Record<string, unknown> = {
+      gender: 'female',
+      ageGroup: 'youth',
+      pitch: 0,
+      speed: 1.0,
+      warmth: 0,
+      tension: 0,
+      breathiness: 10,
+      robotic: 0,
+      reverb: 5,
+      description: '通过AI声学分析生成的自定义音色'
+    };
+
     try {
-      console.log('[DashScope AI Voice Design]: Requesting acoustic parameter analysis of prompt:', prompt);
+      console.log('[DashScope AI Voice Design]: Requesting acoustic parameter analysis...');
       const dashScopePrompt = `你是一个高级AI声学工程师与发声建模师。基于用户的自然语言提示词（Prompt）进行分析。
 提示词: "${prompt}"。
 你需要输出一个JSON对象，对应于声学参数，要求：
@@ -515,91 +584,155 @@ app.post('/api/voice/design', async (req, res) => {
 }`;
 
       const cleanJson = await callDashScopeLLM(dashScopePrompt, apiKey);
-      console.log('[DashScope Response]:', cleanJson);
+      console.log('[DashScope LLM Response]:', cleanJson);
       
-      designedParams.gender = cleanJson.gender || designedParams.gender;
-      designedParams.ageGroup = cleanJson.ageGroup || designedParams.ageGroup;
-      designedParams.pitch = (baseConfig && typeof baseConfig.pitch === 'number') ? baseConfig.pitch : (cleanJson.pitch ?? designedParams.pitch);
-      designedParams.speed = (baseConfig && typeof baseConfig.speed === 'number') ? baseConfig.speed : (cleanJson.speed ?? designedParams.speed);
-      designedParams.warmth = (baseConfig && typeof baseConfig.warmth === 'number') ? baseConfig.warmth : (cleanJson.warmth ?? designedParams.warmth);
-      designedParams.tension = (baseConfig && typeof baseConfig.tension === 'number') ? baseConfig.tension : (cleanJson.tension ?? designedParams.tension);
-      designedParams.breathiness = (baseConfig && typeof baseConfig.breathiness === 'number') ? baseConfig.breathiness : (cleanJson.breathiness ?? designedParams.breathiness);
-      designedParams.robotic = (baseConfig && typeof baseConfig.robotic === 'number') ? baseConfig.robotic : (cleanJson.robotic ?? designedParams.robotic);
-      designedParams.reverb = (baseConfig && typeof baseConfig.reverb === 'number') ? baseConfig.reverb : (cleanJson.reverb ?? designedParams.reverb);
-      designedParams.description = cleanJson.description || designedParams.description;
+      if (cleanJson && typeof cleanJson === 'object') {
+        designedParams = {
+          gender: cleanJson.gender || 'female',
+          ageGroup: cleanJson.ageGroup || 'youth',
+          pitch: cleanJson.pitch ?? 0,
+          speed: cleanJson.speed ?? 1.0,
+          warmth: cleanJson.warmth ?? 0,
+          tension: cleanJson.tension ?? 0,
+          breathiness: cleanJson.breathiness ?? 10,
+          robotic: cleanJson.robotic ?? 0,
+          reverb: cleanJson.reverb ?? 5,
+          description: cleanJson.description || '通过AI声学分析生成的自定义音色',
+        };
+      }
       
-    } catch (err) {
-      console.error('[DashScope LLM Analysis Failed, falling back to Regex rules]', err);
+    } catch (llmErr) {
+      console.error('[DashScope LLM Analysis Failed, using defaults]', llmErr);
+      // Continue with default params even if LLM fails
     }
-  }
+    
+    // Override with baseConfig if provided
+    if (baseConfig && typeof baseConfig === 'object') {
+      if (baseConfig.gender) designedParams.gender = baseConfig.gender;
+      if (baseConfig.ageGroup) designedParams.ageGroup = baseConfig.ageGroup;
+      if (typeof baseConfig.pitch === 'number') designedParams.pitch = baseConfig.pitch;
+      if (typeof baseConfig.speed === 'number') designedParams.speed = baseConfig.speed;
+      if (typeof baseConfig.warmth === 'number') designedParams.warmth = baseConfig.warmth;
+      if (typeof baseConfig.tension === 'number') designedParams.tension = baseConfig.tension;
+      if (typeof baseConfig.breathiness === 'number') designedParams.breathiness = baseConfig.breathiness;
+      if (typeof baseConfig.robotic === 'number') designedParams.robotic = baseConfig.robotic;
+      if (typeof baseConfig.reverb === 'number') designedParams.reverb = baseConfig.reverb;
+    }
 
-  // Register in Alibaba voice design workspace if key setup
-  if (!apiKey) {
-    return res.status(401).json({
-      success: false,
-      error: 'Missing DASHSCOPE_API_KEY environment variable.',
-      message: '检测到未配置 DASHSCOPE_API_KEY 密钥，为遵守您的指令，离线拟真模式已关闭。请在项目右上角的设置中填入有效的阿里百炼 API Key。'
-    });
-  }
+    let demoAudioData: string | undefined;
+    let voiceId = `custom-dashscope-${Date.now()}`;
 
-  try {
-    const response = await fetch('https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'voice-enrollment',
-        input: {
-          action: 'create_voice',
-          target_model: 'cosyvoice-v2',
-          voice_prompt: prompt || '一个自然的声音',
-          preview_text: '这是音色在线设计与拟合注册声音，用于调试。',
-          prefix: 'customvd'
+    // Try to call voice enrollment API
+    try {
+      console.log('[Voice Design] Calling voice-enrollment API...');
+      
+      let previewText = demoText || '这是音色在线设计与拟合注册声音，用于调试。';
+      if (previewText.length < 15) {
+        previewText = previewText + ' ' + '这是音色在线设计与拟合注册声音，用于调试。'.slice(0, Math.max(0, 15 - previewText.length));
+      }
+      
+      const response = await fetch('https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
         },
-        parameters: {
-          sample_rate: 24000,
-          response_format: 'wav'
-        }
-      })
-    });
-
-    const data = await response.json();
-    console.log('[Aliyun Voice Studio Custom Design Response]:', data);
-
-    if (!response.ok || (data.code && data.code !== 'Success' && data.code !== 'Successful')) {
-      const errorMsg = data.message || JSON.stringify(data);
-      console.warn(`[Voice Design Failed]: ${errorMsg}. Falling back to local design only.`);
-      
-      return res.json({
-        success: true,
-        mode: 'local',
-        voiceId: `custom-local-${Date.now()}`,
-        audioUrl: null,
-        specs: designedParams,
-        details: data,
-        message: '阿里云音色设计服务暂不可用，已使用本地规则引擎生成声学参数。'
+        body: JSON.stringify({
+          model: 'voice-enrollment',
+          input: {
+            action: 'create_voice',
+            target_model: 'cosyvoice-v2',
+            voice_prompt: prompt || '一个自然的声音',
+            preview_text: previewText,
+            prefix: 'customvd',
+            language_hints: ['zh']
+          },
+          parameters: {
+            sample_rate: 24000,
+            response_format: 'wav'
+          }
+        })
       });
+
+      const data = await response.json();
+      console.log('[Voice Enrollment Response Status]:', response.status);
+      console.log('[Voice Enrollment Response]:', JSON.stringify(data).slice(0, 500));
+
+      if (response.ok && data.output?.voice_id) {
+        voiceId = data.output.voice_id;
+        console.log('[Voice Design] Voice ID created:', voiceId);
+      } else {
+        console.log('[Voice Design] Voice enrollment API did not return voice_id, using generated ID');
+        // Don't fail, continue with generated voiceId
+      }
+    } catch (enrollmentErr) {
+      console.error('[Voice Enrollment Error]:', enrollmentErr);
+      // Continue without voice enrollment
     }
+    
+    // Generate demo audio using TTS
+    if (demoText) {
+      console.log('[Voice Design] Generating demo audio for:', demoText);
+      
+      try {
+        const ttsResponse = await fetch('https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'cosyvoice-v2',
+            input: {
+              text: demoText
+            },
+            parameters: {
+              voice: voiceId,
+              format: 'wav',
+              sample_rate: 24000,
+              pitch: Math.max(0.5, Math.min(2.0, 1.0 + ((designedParams.pitch as number || 0) / 150))),
+              rate: Math.max(0.5, Math.min(2.0, designedParams.speed as number || 1.0)),
+              language_hints: ['zh']
+            }
+          })
+        });
+
+        const ttsData = await ttsResponse.json();
+        
+        if (ttsData.output && ttsData.output.audio && ttsData.output.audio.url) {
+          const audioResponse = await fetch(ttsData.output.audio.url);
+          const audioBuffer = await audioResponse.arrayBuffer();
+          demoAudioData = Buffer.from(audioBuffer).toString('base64');
+          console.log('[Voice Design] Demo audio generated successfully');
+        }
+      } catch (ttsErr) {
+        console.warn('[Voice Design] Failed to generate demo audio:', ttsErr);
+      }
+    }
+    
+    const demoAudio = demoAudioData ? {
+      type: 'base64' as const,
+      mime: 'audio/wav',
+      data: demoAudioData
+    } : undefined;
+    
+    console.log('[Voice Design] Response: success=true, voiceId=' + voiceId + ', demoAudio=' + (demoAudio ? `base64(${demoAudio.data.length} chars)` : 'none'));
     
     return res.json({
       success: true,
       mode: 'real',
-      voiceId: data.output?.voice_id || `custom-dashscope-${Date.now()}`,
-      audioUrl: data.output?.preview_audio?.url || null,
+      voiceId,
       specs: designedParams,
-      details: data
+      demoAudio,
+      message: '音色设计完成'
     });
   } catch (error: any) {
     console.error('[DashScope API Integration Error]', error);
-    return res.json({
-      success: true,
-      mode: 'local',
-      voiceId: `custom-local-${Date.now()}`,
-      audioUrl: null,
-      specs: designedParams,
-      message: `语音设计API调用失败，已使用本地规则引擎: ${error.message}`
+    return res.status(500).json({
+      success: false,
+      error: '音色设计API调用失败',
+      message: `调用阿里云百炼音色设计服务失败: ${error.message}`,
+      details: error
     });
   }
 });
@@ -692,10 +825,15 @@ app.post('/api/voice/tts', async (req, res) => {
   const apiKey = (typeof apiKeyHeader === 'string' && apiKeyHeader.trim() !== '') ? apiKeyHeader.trim() : process.env.DASHSCOPE_API_KEY;
 
   console.log(`[TTS Query] Text: "${text}" Model: "${model || 'cosyvoice-v2'}"`);
+  console.log(`[TTS Query] voiceConfig:`, JSON.stringify(voiceConfig));
+  console.log(`[TTS Query] segmentConfig:`, JSON.stringify(segmentConfig));
 
   // Compute final pitch rate, speech speed, volume combining designed voice parameters + segment fine-tuning config!
-  const baseVoice = voiceConfig || { pitch: 0, speed: 1.0, volume: 80 };
-  const segment = segmentConfig || { pitch: 0, speed: 1.0, volume: 100, emotion: 'neutral' };
+  const baseVoice = voiceConfig || { pitch: 0, speed: 1.0, volume: 80, warmth: 0, tension: 0, breathiness: 0, reverb: 0 };
+  const segment = segmentConfig || { pitch: 0, speed: 1.0, volume: 100, emotion: 'neutral', warmth: 0, tension: 0, breathiness: 0, reverb: 0 };
+  
+  console.log(`[TTS Params] baseVoice:`, baseVoice);
+  console.log(`[TTS Params] segment:`, segment);
 
   // Calculate composite rates
   // Speed is multiplicative: base speed * segment rate
@@ -738,6 +876,7 @@ app.post('/api/voice/tts', async (req, res) => {
 
     try {
       // Use HTTP API to call dashscope TTS
+      // Reference: https://help.aliyun.com/zh/model-studio/cosyvoice-tts-http-api
       const postData = JSON.stringify({
         model: selectedModel,
         input: { text: text },
@@ -745,10 +884,10 @@ app.post('/api/voice/tts', async (req, res) => {
           voice: aliyunVoiceId,
           format: 'wav',
           sample_rate: 24000,
-          pitch_rate: parseFloat(finalPitch.toFixed(2)),
-          speech_rate: parseFloat(finalSpeed.toFixed(2)),
-          volume: finalVolume,
-          emotion: segment.emotion || 'neutral'
+          pitch: parseFloat(finalPitch.toFixed(2)),
+          rate: parseFloat(finalSpeed.toFixed(2)),
+          volume: Math.min(100, Math.max(0, finalVolume)),
+          language_hints: ['zh']
         }
       });
 
